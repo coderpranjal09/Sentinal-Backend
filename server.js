@@ -3,12 +3,20 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
-
+const cors = require("cors");
 const app = express();
 
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+app.use(cors({
+    origin: [
+        "http://localhost:5173"
+    ],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+}));
 
 // ============================================================
 // CONFIG
