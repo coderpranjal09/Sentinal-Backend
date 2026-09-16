@@ -5,6 +5,7 @@ const axios = require("axios");
 const FormData = require("form-data");
 const cors = require("cors");
 const sharp = require("sharp");
+const { fromArrayBuffer } = require("geotiff");
 const cloudinary = require("cloudinary").v2;
 const app = express();
 
@@ -349,16 +350,33 @@ async function getSentinelImage(
         "bytes"
     );
 
-    // IMPORTANT:
-    // Nothing is saved to disk.
-    // TIFF exists only in memory.
-
     return tiffBuffer;
 }
 
 // ============================================================
-// TIFF -> PNG CONVERSION (in-memory)
+// TIFF -> PNG CONVERSION (in-memory, via geotiff)
 // ============================================================
+
+/**
+ * Percentile-stretch a Float32Array band to 0-255.
+ */
+function stretchBand(band, lowPct = 2, highPct = 98) {
+
+    const sorted = Float32Array.from(band).sort();
+
+    const lo = sorted[Math.floor(sorted.length * (lowPct / 100))];
+    const hi = sorted[Math.floor(sorted.length * (highPct / 100))];
+    const range = (hi - lo) || 1;
+
+    const out = Buffer.alloc(band.length);
+
+    for (let i = 0; i < band.length; i++) {
+        const v = (band[i] - lo) / range;
+        out[i] = Math.max(0, Math.min(255, Math.round(v * 255)));
+    }
+
+    return out;
+}
 
 async function tiffToPng(tiffBuffer) {
 
@@ -367,83 +385,59 @@ async function tiffToPng(tiffBuffer) {
     console.log("CONVERTING TIFF -> PNG");
     console.log("=================================");
 
-    // The Sentinel TIFF has 14 float32 bands. Only the first band is a
-    // valid greyscale image; to visualise a realistic satellite RGB we
-    // take B02 (blue, band index 1), B03 (green, index 2), B04 (red,
-    // index 3). We normalise each band into 0-255 and combine into RGB.
+    // Decode the TIFF with geotiff. This correctly handles the
+    // multi-band float32 planar layout that Copernicus returns,
+    // which sharp cannot read on its own.
+    const arrayBuffer = tiffBuffer.buffer.slice(
+        tiffBuffer.byteOffset,
+        tiffBuffer.byteOffset + tiffBuffer.byteLength
+    );
 
-    const { data, info } = await sharp(tiffBuffer, {
-        raw: undefined,
-        limitInputPixels: false
-    })
-        .raw()
-        .toBuffer({ resolveWithObject: true });
+    const tiff = await fromArrayBuffer(arrayBuffer);
+    const image = await tiff.getImage();
 
-    const { width, height, channels } = info;
+    const width = image.getWidth();
+    const height = image.getHeight();
+    const samplesPerPixel = image.getSamplesPerPixel();
 
-    if (channels < 4) {
-        // Not the expected 14-band stacked layout; fall back to a simple
-        // greyscale conversion of whatever sharp can render.
-        console.log(
-            `Unexpected channel count (${channels}); falling back to grayscale`
+    console.log(`TIFF: ${width}x${height}, ${samplesPerPixel} bands`);
+
+    // Read all bands at once as a single Float32Array of length
+    // width * height * samplesPerPixel (planar layout: band0 then
+    // band1 then band2 …).
+    const rasters = await image.readRasters({ interleave: false });
+
+    if (!rasters || rasters.length < 4) {
+        throw new Error(
+            `Expected at least 4 bands in TIFF, got ${rasters?.length ?? 0}`
         );
-        return sharp(tiffBuffer, { limitInputPixels: false })
-            .png()
-            .toBuffer();
     }
 
-    // Sentinel patch: 14 bands, float32, planar (band-sequential).
     const pixelCount = width * height;
-    const expectedBytes = pixelCount * channels * 4; // float32
 
-    if (data.length !== expectedBytes) {
-        // Interleaved fallback — just render whatever sharp produced.
-        console.log(
-            `Raw size mismatch (${data.length} vs ${expectedBytes}); using default PNG`
+    // Band order from our evalscript:
+    // 0=B01 1=B02(blue) 2=B03(green) 3=B04(red) 4=B05 ...
+    // Geotiff returns rasters in the same order.
+    const blue = rasters[1];
+    const green = rasters[2];
+    const red = rasters[3];
+
+    if (
+        blue.length !== pixelCount ||
+        green.length !== pixelCount ||
+        red.length !== pixelCount
+    ) {
+        throw new Error(
+            `Band size mismatch: expected ${pixelCount}, got r=${red.length} g=${green.length} b=${blue.length}`
         );
-        return sharp(tiffBuffer, { limitInputPixels: false })
-            .png()
-            .toBuffer();
     }
 
-    // Helper: extract a band's float values by reading every `channels`th
-    // float starting at `bandIndex`. This is a safeguard for either
-    // planar or interleaved layouts — Sentinel returns planar in
-    // practice, in which case B02 is at offset pixelCount*1, etc.
-    const readBandPlanar = (bandIndex) => {
-        const start = bandIndex * pixelCount * 4;
-        const out = new Float32Array(pixelCount);
-        for (let i = 0; i < pixelCount; i++) {
-            out[i] = data.readFloatLE(start + i * 4);
-        }
-        return out;
-    };
-
-    // B02 blue (index 1), B03 green (index 2), B04 red (index 3)
-    const blue = readBandPlanar(1);
-    const green = readBandPlanar(2);
-    const red = readBandPlanar(3);
-
-    // Normalise each band to 0-255 with a percentile stretch so the
-    // image has reasonable contrast instead of being nearly black.
-    const stretch = (band) => {
-        const sorted = Float32Array.from(band).sort();
-        const lo = sorted[Math.floor(sorted.length * 0.02)];
-        const hi = sorted[Math.floor(sorted.length * 0.98)];
-        const range = hi - lo || 1;
-        const out = Buffer.alloc(pixelCount);
-        for (let i = 0; i < pixelCount; i++) {
-            const v = (band[i] - lo) / range;
-            out[i] = Math.max(0, Math.min(255, Math.round(v * 255)));
-        }
-        return out;
-    };
-
-    const r = stretch(red);
-    const g = stretch(green);
-    const b = stretch(blue);
+    const r = stretchBand(red);
+    const g = stretchBand(green);
+    const b = stretchBand(blue);
 
     const rgb = Buffer.alloc(pixelCount * 3);
+
     for (let i = 0; i < pixelCount; i++) {
         rgb[i * 3] = r[i];
         rgb[i * 3 + 1] = g[i];
@@ -498,11 +492,7 @@ async function uploadSentinelImages(
     console.log("UPLOADING TO CLOUDINARY");
     console.log("=================================");
 
-    // A stable-ish folder + public id per location. Timestamp ensures
-    // each call produces a fresh asset so the CDN doesn't serve a stale
-    // image for the same coordinates.
-    const stamp =
-        Date.now();
+    const stamp = Date.now();
 
     const safeLat =
         String(latitude).replace(/[^0-9.-]/g, "_");
@@ -510,38 +500,42 @@ async function uploadSentinelImages(
     const safeLon =
         String(longitude).replace(/[^0-9.-]/g, "_");
 
-    const folder =
-        "sentinel-landslide";
+    const folder = "sentinel-landslide";
 
     const baseId =
         `patch_${safeLat}_${safeLon}_${stamp}`;
 
-    const [tiffResult, pngResult] =
-        await Promise.all([
+    const uploads = [
 
-            uploadToCloudinary(tiffBuffer, {
-                resource_type: "raw",
-                folder,
-                public_id: `${baseId}.tif`,
-                overwrite: true
-            }),
+        uploadToCloudinary(tiffBuffer, {
+            resource_type: "raw",
+            folder,
+            public_id: `${baseId}.tif`,
+            overwrite: true
+        })
+    ];
 
+    if (pngBuffer) {
+        uploads.push(
             uploadToCloudinary(pngBuffer, {
                 resource_type: "image",
                 folder,
-                public_id: `${baseId}`,
+                public_id: baseId,
                 overwrite: true
             })
-        ]);
+        );
+    }
+
+    const [tiffResult, pngResult] = await Promise.all(uploads);
 
     console.log("TIFF URL:", tiffResult.secure_url);
-    console.log("PNG  URL:", pngResult.secure_url);
+    if (pngResult) console.log("PNG  URL:", pngResult.secure_url);
 
     return {
         tiffUrl: tiffResult.secure_url,
-        pngUrl: pngResult.secure_url,
+        pngUrl: pngResult?.secure_url ?? null,
         tiffPublicId: tiffResult.public_id,
-        pngPublicId: pngResult.public_id
+        pngPublicId: pngResult?.public_id ?? null
     };
 }
 
@@ -556,8 +550,7 @@ async function sendToMLModel(tiffBuffer) {
     console.log("SENDING TIFF TO ML MODEL");
     console.log("=================================");
 
-    const form =
-        new FormData();
+    const form = new FormData();
 
     form.append(
         "file",
@@ -573,20 +566,14 @@ async function sendToMLModel(tiffBuffer) {
             ML_API,
             form,
             {
-
                 headers: {
                     ...form.getHeaders()
                 },
-
-                timeout:
-                    180000
+                timeout: 180000
             }
         );
 
-    console.log(
-        "ML RESPONSE:",
-        response.data
-    );
+    console.log("ML RESPONSE:", response.data);
 
     return response.data;
 }
@@ -601,10 +588,7 @@ app.post(
 
         try {
 
-            const {
-                latitude,
-                longitude
-            } = req.body;
+            const { latitude, longitude } = req.body;
 
             // ----------------------------------------
             // VALIDATION
@@ -614,61 +598,33 @@ app.post(
                 latitude === undefined ||
                 longitude === undefined
             ) {
-
                 return res.status(400).json({
-
                     success: false,
-
-                    message:
-                        "Latitude and longitude are required"
+                    message: "Latitude and longitude are required"
                 });
             }
 
-            const lat =
-                Number(latitude);
+            const lat = Number(latitude);
+            const lon = Number(longitude);
 
-            const lon =
-                Number(longitude);
-
-            if (
-                !Number.isFinite(lat) ||
-                !Number.isFinite(lon)
-            ) {
-
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
                 return res.status(400).json({
-
                     success: false,
-
-                    message:
-                        "Latitude and longitude must be valid numbers"
+                    message: "Latitude and longitude must be valid numbers"
                 });
             }
 
-            if (
-                lat < -90 ||
-                lat > 90
-            ) {
-
+            if (lat < -90 || lat > 90) {
                 return res.status(400).json({
-
                     success: false,
-
-                    message:
-                        "Invalid latitude"
+                    message: "Invalid latitude"
                 });
             }
 
-            if (
-                lon < -180 ||
-                lon > 180
-            ) {
-
+            if (lon < -180 || lon > 180) {
                 return res.status(400).json({
-
                     success: false,
-
-                    message:
-                        "Invalid longitude"
+                    message: "Invalid longitude"
                 });
             }
 
@@ -676,27 +632,15 @@ app.post(
             // 1. COPERNICUS TOKEN
             // ----------------------------------------
 
-            console.log(
-                "\nGetting Copernicus token..."
-            );
-
-            const token =
-                await getToken();
-
-            console.log(
-                "Copernicus authentication successful"
-            );
+            console.log("\nGetting Copernicus token...");
+            const token = await getToken();
+            console.log("Copernicus authentication successful");
 
             // ----------------------------------------
             // 2. GET SENTINEL TIFF
             // ----------------------------------------
 
-            const tiffBuffer =
-                await getSentinelImage(
-                    token,
-                    lat,
-                    lon
-                );
+            const tiffBuffer = await getSentinelImage(token, lat, lon);
 
             // ----------------------------------------
             // 3. BUILD PNG PREVIEW (in-memory)
@@ -705,17 +649,10 @@ app.post(
             let pngBuffer = null;
 
             try {
-
-                pngBuffer =
-                    await tiffToPng(tiffBuffer);
-
+                pngBuffer = await tiffToPng(tiffBuffer);
             } catch (pngError) {
-
-                // A PNG failure should NOT block the prediction.
-                console.error(
-                    "PNG conversion failed:",
-                    pngError.message
-                );
+                console.error("PNG conversion failed:", pngError.message);
+                console.error(pngError.stack);
             }
 
             // ----------------------------------------
@@ -730,80 +667,44 @@ app.post(
             };
 
             try {
-
-                images =
-                    await uploadSentinelImages(
-                        tiffBuffer,
-                        pngBuffer ?? tiffBuffer,
-                        lat,
-                        lon
-                    );
-
-                // If PNG conversion failed, we uploaded the TIFF bytes
-                // as the "png" asset — drop that misleading URL.
-                if (!pngBuffer) {
-                    images.pngUrl = null;
-                    images.pngPublicId = null;
-                }
-
-            } catch (uploadError) {
-
-                // An upload failure should NOT block the prediction
-                // either — we still want to return the ML result.
-                console.error(
-                    "Cloudinary upload failed:",
-                    uploadError.message
+                images = await uploadSentinelImages(
+                    tiffBuffer,
+                    pngBuffer,
+                    lat,
+                    lon
                 );
+            } catch (uploadError) {
+                console.error("Cloudinary upload failed:", uploadError.message);
             }
 
             // ----------------------------------------
             // 5. DIRECTLY SEND TIFF TO ML
             // ----------------------------------------
 
-            const prediction =
-                await sendToMLModel(
-                    tiffBuffer
-                );
+            const prediction = await sendToMLModel(tiffBuffer);
 
             // ----------------------------------------
             // 6. RETURN ML RESPONSE + IMAGE URLS
             // ----------------------------------------
 
             return res.status(200).json({
-
                 ...prediction,
-
                 images
             });
 
         } catch (error) {
 
             console.error("");
-            console.error(
-                "================================="
-            );
-            console.error(
-                "PREDICTION ERROR"
-            );
-            console.error(
-                "================================="
-            );
-
-            console.error(
-                error.response?.data ||
-                error.message
-            );
+            console.error("=================================");
+            console.error("PREDICTION ERROR");
+            console.error("=================================");
+            console.error(error.response?.data || error.message);
+            console.error(error.stack);
 
             return res.status(500).json({
-
                 success: false,
-
-                message:
-                    "Failed to process Sentinel prediction",
-
-                error:
-                    error.response?.data ||
-                    error.message
+                message: "Failed to process Sentinel prediction",
+                error: error.response?.data || error.message
             });
         }
     }
@@ -816,34 +717,13 @@ app.post(
 app.listen(
     PORT,
     () => {
-
         console.log("");
-        console.log(
-            "================================="
-        );
-
-        console.log(
-            "SENTINEL LANDSLIDE SERVER"
-        );
-
-        console.log(
-            "================================="
-        );
-
-        console.log(
-            `Server running on port ${PORT}`
-        );
-
-        console.log(
-            `Home   : http://localhost:${PORT}/`
-        );
-
-        console.log(
-            `Predict: POST http://localhost:${PORT}/predict`
-        );
-
-        console.log(
-            "================================="
-        );
+        console.log("=================================");
+        console.log("SENTINEL LANDSLIDE SERVER");
+        console.log("=================================");
+        console.log(`Server running on port ${PORT}`);
+        console.log(`Home   : http://localhost:${PORT}/`);
+        console.log(`Predict: POST http://localhost:${PORT}/predict`);
+        console.log("=================================");
     }
 );
