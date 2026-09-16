@@ -4,6 +4,8 @@ const express = require("express");
 const axios = require("axios");
 const FormData = require("form-data");
 const cors = require("cors");
+const sharp = require("sharp");
+const cloudinary = require("cloudinary").v2;
 const app = express();
 
 app.use(express.json());
@@ -17,6 +19,17 @@ app.use(cors({
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
 }));
+
+// ============================================================
+// CLOUDINARY CONFIG
+// ============================================================
+
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true
+});
 
 // ============================================================
 // CONFIG
@@ -344,6 +357,195 @@ async function getSentinelImage(
 }
 
 // ============================================================
+// TIFF -> PNG CONVERSION (in-memory)
+// ============================================================
+
+async function tiffToPng(tiffBuffer) {
+
+    console.log("");
+    console.log("=================================");
+    console.log("CONVERTING TIFF -> PNG");
+    console.log("=================================");
+
+    // The Sentinel TIFF has 14 float32 bands. Only the first band is a
+    // valid greyscale image; to visualise a realistic satellite RGB we
+    // take B02 (blue, band index 1), B03 (green, index 2), B04 (red,
+    // index 3). We normalise each band into 0-255 and combine into RGB.
+
+    const { data, info } = await sharp(tiffBuffer, {
+        raw: undefined,
+        limitInputPixels: false
+    })
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+    const { width, height, channels } = info;
+
+    if (channels < 4) {
+        // Not the expected 14-band stacked layout; fall back to a simple
+        // greyscale conversion of whatever sharp can render.
+        console.log(
+            `Unexpected channel count (${channels}); falling back to grayscale`
+        );
+        return sharp(tiffBuffer, { limitInputPixels: false })
+            .png()
+            .toBuffer();
+    }
+
+    // Sentinel patch: 14 bands, float32, planar (band-sequential).
+    const pixelCount = width * height;
+    const expectedBytes = pixelCount * channels * 4; // float32
+
+    if (data.length !== expectedBytes) {
+        // Interleaved fallback — just render whatever sharp produced.
+        console.log(
+            `Raw size mismatch (${data.length} vs ${expectedBytes}); using default PNG`
+        );
+        return sharp(tiffBuffer, { limitInputPixels: false })
+            .png()
+            .toBuffer();
+    }
+
+    // Helper: extract a band's float values by reading every `channels`th
+    // float starting at `bandIndex`. This is a safeguard for either
+    // planar or interleaved layouts — Sentinel returns planar in
+    // practice, in which case B02 is at offset pixelCount*1, etc.
+    const readBandPlanar = (bandIndex) => {
+        const start = bandIndex * pixelCount * 4;
+        const out = new Float32Array(pixelCount);
+        for (let i = 0; i < pixelCount; i++) {
+            out[i] = data.readFloatLE(start + i * 4);
+        }
+        return out;
+    };
+
+    // B02 blue (index 1), B03 green (index 2), B04 red (index 3)
+    const blue = readBandPlanar(1);
+    const green = readBandPlanar(2);
+    const red = readBandPlanar(3);
+
+    // Normalise each band to 0-255 with a percentile stretch so the
+    // image has reasonable contrast instead of being nearly black.
+    const stretch = (band) => {
+        const sorted = Float32Array.from(band).sort();
+        const lo = sorted[Math.floor(sorted.length * 0.02)];
+        const hi = sorted[Math.floor(sorted.length * 0.98)];
+        const range = hi - lo || 1;
+        const out = Buffer.alloc(pixelCount);
+        for (let i = 0; i < pixelCount; i++) {
+            const v = (band[i] - lo) / range;
+            out[i] = Math.max(0, Math.min(255, Math.round(v * 255)));
+        }
+        return out;
+    };
+
+    const r = stretch(red);
+    const g = stretch(green);
+    const b = stretch(blue);
+
+    const rgb = Buffer.alloc(pixelCount * 3);
+    for (let i = 0; i < pixelCount; i++) {
+        rgb[i * 3] = r[i];
+        rgb[i * 3 + 1] = g[i];
+        rgb[i * 3 + 2] = b[i];
+    }
+
+    const pngBuffer = await sharp(rgb, {
+        raw: { width, height, channels: 3 }
+    })
+        .png()
+        .toBuffer();
+
+    console.log("PNG generated:", pngBuffer.length, "bytes");
+
+    return pngBuffer;
+}
+
+// ============================================================
+// CLOUDINARY UPLOAD
+// ============================================================
+
+function uploadToCloudinary(buffer, options) {
+
+    return new Promise((resolve, reject) => {
+
+        const stream =
+            cloudinary.uploader.upload_stream(
+                options,
+                (error, result) => {
+
+                    if (error) {
+                        return reject(error);
+                    }
+
+                    resolve(result);
+                }
+            );
+
+        stream.end(buffer);
+    });
+}
+
+async function uploadSentinelImages(
+    tiffBuffer,
+    pngBuffer,
+    latitude,
+    longitude
+) {
+
+    console.log("");
+    console.log("=================================");
+    console.log("UPLOADING TO CLOUDINARY");
+    console.log("=================================");
+
+    // A stable-ish folder + public id per location. Timestamp ensures
+    // each call produces a fresh asset so the CDN doesn't serve a stale
+    // image for the same coordinates.
+    const stamp =
+        Date.now();
+
+    const safeLat =
+        String(latitude).replace(/[^0-9.-]/g, "_");
+
+    const safeLon =
+        String(longitude).replace(/[^0-9.-]/g, "_");
+
+    const folder =
+        "sentinel-landslide";
+
+    const baseId =
+        `patch_${safeLat}_${safeLon}_${stamp}`;
+
+    const [tiffResult, pngResult] =
+        await Promise.all([
+
+            uploadToCloudinary(tiffBuffer, {
+                resource_type: "raw",
+                folder,
+                public_id: `${baseId}.tif`,
+                overwrite: true
+            }),
+
+            uploadToCloudinary(pngBuffer, {
+                resource_type: "image",
+                folder,
+                public_id: `${baseId}`,
+                overwrite: true
+            })
+        ]);
+
+    console.log("TIFF URL:", tiffResult.secure_url);
+    console.log("PNG  URL:", pngResult.secure_url);
+
+    return {
+        tiffUrl: tiffResult.secure_url,
+        pngUrl: pngResult.secure_url,
+        tiffPublicId: tiffResult.public_id,
+        pngPublicId: pngResult.public_id
+    };
+}
+
+// ============================================================
 // SEND TIFF DIRECTLY TO ML MODEL
 // ============================================================
 
@@ -497,7 +699,65 @@ app.post(
                 );
 
             // ----------------------------------------
-            // 3. DIRECTLY SEND TIFF TO ML
+            // 3. BUILD PNG PREVIEW (in-memory)
+            // ----------------------------------------
+
+            let pngBuffer = null;
+
+            try {
+
+                pngBuffer =
+                    await tiffToPng(tiffBuffer);
+
+            } catch (pngError) {
+
+                // A PNG failure should NOT block the prediction.
+                console.error(
+                    "PNG conversion failed:",
+                    pngError.message
+                );
+            }
+
+            // ----------------------------------------
+            // 4. UPLOAD TO CLOUDINARY (both formats)
+            // ----------------------------------------
+
+            let images = {
+                tiffUrl: null,
+                pngUrl: null,
+                tiffPublicId: null,
+                pngPublicId: null
+            };
+
+            try {
+
+                images =
+                    await uploadSentinelImages(
+                        tiffBuffer,
+                        pngBuffer ?? tiffBuffer,
+                        lat,
+                        lon
+                    );
+
+                // If PNG conversion failed, we uploaded the TIFF bytes
+                // as the "png" asset — drop that misleading URL.
+                if (!pngBuffer) {
+                    images.pngUrl = null;
+                    images.pngPublicId = null;
+                }
+
+            } catch (uploadError) {
+
+                // An upload failure should NOT block the prediction
+                // either — we still want to return the ML result.
+                console.error(
+                    "Cloudinary upload failed:",
+                    uploadError.message
+                );
+            }
+
+            // ----------------------------------------
+            // 5. DIRECTLY SEND TIFF TO ML
             // ----------------------------------------
 
             const prediction =
@@ -506,12 +766,15 @@ app.post(
                 );
 
             // ----------------------------------------
-            // 4. RETURN ML RESPONSE
+            // 6. RETURN ML RESPONSE + IMAGE URLS
             // ----------------------------------------
 
-            return res.status(200).json(
-                prediction
-            );
+            return res.status(200).json({
+
+                ...prediction,
+
+                images
+            });
 
         } catch (error) {
 
